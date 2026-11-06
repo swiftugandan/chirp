@@ -436,7 +436,7 @@ export default function Explainer() {
       {/* Not rendered while presenting: the slides cover it, and keyboard focus must stay on them. */}
       {!presenting && (
         <nav className="ex-banner" aria-label="Page">
-          <a href="/">[ ← GO BACK TO APP ]</a>
+          <a href={import.meta.env.BASE_URL}>[ ← GO BACK TO APP ]</a>
           <button ref={presentRef} className="btn" onClick={present}>
             [ ▶ PRESENTATION MODE ]
           </button>

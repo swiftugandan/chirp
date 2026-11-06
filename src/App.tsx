@@ -1155,7 +1155,7 @@ function App() {
         </span>
         <span className="spacer" />
         {/* A page of its own, so its sound demos can never play over this app's transfers. */}
-        <a className="btn explain-toggle" href="/explain/">
+        <a className="btn explain-toggle" href={`${import.meta.env.BASE_URL}explain/`}>
           [ ? EXPLAIN THIS ]
         </a>
         <span className="credits">

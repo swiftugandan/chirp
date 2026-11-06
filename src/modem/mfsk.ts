@@ -66,6 +66,13 @@ const SYNC_MIN_SYMBOL = 0.2;
 const SYNC_SETTLE_HOPS = 3;
 const TIMING_GAIN = 0.1;
 const RING_SIZE = 1 << 18;
+// Doppler search: ±3000 ppm (about ±1 m/s of relative motion) in 100 ppm steps.
+const DOPPLER_STEP = 100e-6;
+const DOPPLER_STEPS = 30;
+const DOPPLER_REBUILD = 20e-6;
+const FREQ_GAIN = 0.05;
+/** Doppler offsets the preamble search also listens at (besides nominal). */
+const SEARCH_BANKS = [-1500e-6, 1500e-6];
 
 const preambleValue = (symbol: number, group: number) => PREAMBLE[(symbol + 3 * group) % PREAMBLE.length];
 
@@ -209,8 +216,8 @@ export function createMfskModem(p: MfskProfile): Modem {
 
 interface HopRecord {
   start: number;
-  /** Per-bin energy share within its group. */
-  share: Float32Array;
+  /** Per-bin energy share within its group, one array per search bank (0 = nominal). */
+  shares: Float32Array[];
 }
 
 interface Lock {
@@ -234,8 +241,14 @@ class MfskDemodulator implements Demodulator {
   private readonly hop: number;
   private readonly trackOffset: number;
   private readonly maxAdjust: number;
-  private readonly cos: Float32Array[];
-  private readonly sin: Float32Array[];
+  private cos: Float32Array[] = [];
+  private sin: Float32Array[] = [];
+  private readonly sampleRate: number;
+  /** Doppler / clock factor applied to every tone frequency (1 = nominal). */
+  private scale = 1;
+  private tableScale = 1;
+  /** Extra correlators at fixed Doppler offsets, used only by the preamble search. */
+  private searchBanks: { cos: Float32Array[]; sin: Float32Array[] }[] = [];
   private readonly ring = new Float32Array(RING_SIZE);
   private readonly frame: Float32Array;
   private readonly energy: Float32Array;
@@ -245,7 +258,7 @@ class MfskDemodulator implements Demodulator {
   private nextHop = 0;
   private hopCount = 0;
   private hops: HopRecord[] = [];
-  private candidate: { score: number; start: number; age: number } | null = null;
+  private candidate: { score: number; start: number; age: number; bank: number } | null = null;
   private lock: Lock | null = null;
 
   constructor(p: MfskProfile, sampleRate: number) {
@@ -258,10 +271,21 @@ class MfskDemodulator implements Demodulator {
     this.maxAdjust = (p.guardSeconds * sampleRate) / 2;
     this.frame = new Float32Array(this.window);
     this.energy = new Float32Array(this.bins);
+    this.sampleRate = sampleRate;
+    for (const k of SEARCH_BANKS) {
+      this.buildTables(1 + k);
+      this.searchBanks.push({ cos: this.cos, sin: this.sin });
+    }
+    this.buildTables(1);
+    this.hopOffsets = PREAMBLE.map((_, i) => Math.round((i * this.period) / this.hop));
+  }
+
+  /** Rebuild the correlator tables for tones scaled by `scale`. */
+  private buildTables(scale: number) {
     this.cos = [];
     this.sin = [];
     for (let b = 0; b < this.bins; b++) {
-      const w = (2 * Math.PI * toneFrequency(p, b)) / sampleRate;
+      const w = (2 * Math.PI * toneFrequency(this.p, b) * scale) / this.sampleRate;
       const c = new Float32Array(this.window);
       const s = new Float32Array(this.window);
       for (let n = 0; n < this.window; n++) {
@@ -271,7 +295,57 @@ class MfskDemodulator implements Demodulator {
       this.cos.push(c);
       this.sin.push(s);
     }
-    this.hopOffsets = PREAMBLE.map((_, i) => Math.round((i * this.period) / this.hop));
+    this.tableScale = scale;
+  }
+
+  /** Energy at an arbitrary frequency over the window starting at absolute sample `start`. */
+  private toneEnergy(start: number, freq: number): number {
+    const mask = RING_SIZE - 1;
+    const w = (2 * Math.PI * freq) / this.sampleRate;
+    const cw = Math.cos(w);
+    const sw = Math.sin(w);
+    let c = 1;
+    let s = 0;
+    let re = 0;
+    let im = 0;
+    for (let n = 0; n < this.window; n++) {
+      const x = this.ring[(start + n) & mask];
+      re += x * c;
+      im += x * s;
+      const c2 = c * cw - s * sw;
+      s = s * cw + c * sw;
+      c = c2;
+    }
+    return re * re + im * im;
+  }
+
+  /** Doppler factor that best explains the preamble at `base` (grid search + parabolic peak). */
+  private estimateScale(base: number): number {
+    const { p } = this;
+    const step = DOPPLER_STEP;
+    const scores: number[] = [];
+    for (let k = -DOPPLER_STEPS; k <= DOPPLER_STEPS; k++) {
+      const sc = 1 + k * step;
+      let hit = 0;
+      for (let s = 0; s < PREAMBLE.length; s++) {
+        const start = Math.round(base + (s * this.period) / sc);
+        for (let g = 0; g < p.groups; g++) hit += this.toneEnergy(start, toneFrequency(p, binOf(p, preambleValue(s, g), g, s)) * sc);
+      }
+      scores.push(hit);
+    }
+    const i = scores.indexOf(Math.max(...scores));
+    let frac = 0;
+    if (i > 0 && i < scores.length - 1) {
+      const [a, b, c] = [scores[i - 1], scores[i], scores[i + 1]];
+      const d = a - 2 * b + c;
+      if (d < 0) frac = (0.5 * (a - c)) / d;
+    }
+    return 1 + (i - DOPPLER_STEPS + frac) * step;
+  }
+
+  private setScale(scale: number) {
+    this.scale = scale;
+    if (Math.abs(scale - this.tableScale) > DOPPLER_REBUILD) this.buildTables(scale);
   }
 
   reset() {
@@ -304,6 +378,8 @@ class MfskDemodulator implements Demodulator {
 
   private resumeSearch(at: number) {
     this.lock = null;
+    if (this.tableScale !== 1) this.buildTables(1);
+    this.scale = 1;
     this.candidate = null;
     this.hops = [];
     this.hopCount = 0;
@@ -348,10 +424,8 @@ class MfskDemodulator implements Demodulator {
   }
 
   /** Energy at one tone over the window `measure` copied into `this.frame`. */
-  private windowEnergy(bin: number): number {
+  private windowEnergy(bin: number, c = this.cos[bin], s = this.sin[bin]): number {
     const f = this.frame;
-    const c = this.cos[bin];
-    const s = this.sin[bin];
     let re = 0;
     let im = 0;
     for (let n = 0; n < this.window; n++) {
@@ -378,16 +452,23 @@ class MfskDemodulator implements Demodulator {
   private stepSearch(events: DemodEvent[]): boolean {
     if (this.nextHop + this.window > this.written) return false;
     const { p } = this;
-    const e = this.measure(this.nextHop);
-    const share = new Float32Array(this.bins);
-    for (let set = 0; set < toneSets(p); set++) {
-      for (let g = 0; g < p.groups; g++) {
-        let total = 1e-20;
-        for (let v = 0; v < TONES; v++) total += e[binOf(p, v, g, set)];
-        for (let v = 0; v < TONES; v++) share[binOf(p, v, g, set)] = e[binOf(p, v, g, set)] / total;
+    this.measure(this.nextHop);
+    const shares: Float32Array[] = [];
+    for (let k = 0; k <= this.searchBanks.length; k++) {
+      const bank = k === 0 ? null : this.searchBanks[k - 1];
+      const e = new Float32Array(this.bins);
+      for (let b = 0; b < this.bins; b++) e[b] = bank ? this.windowEnergy(b, bank.cos[b], bank.sin[b]) : this.energy[b];
+      const share = new Float32Array(this.bins);
+      for (let set = 0; set < toneSets(p); set++) {
+        for (let g = 0; g < p.groups; g++) {
+          let total = 1e-20;
+          for (let v = 0; v < TONES; v++) total += e[binOf(p, v, g, set)];
+          for (let v = 0; v < TONES; v++) share[binOf(p, v, g, set)] = e[binOf(p, v, g, set)] / total;
+        }
       }
+      shares.push(share);
     }
-    this.hops[this.hopCount % 128] = { start: this.nextHop, share };
+    this.hops[this.hopCount % 128] = { start: this.nextHop, shares };
     this.hopCount++;
     this.nextHop += this.hop;
 
@@ -395,23 +476,38 @@ class MfskDemodulator implements Demodulator {
     const first = this.hopCount - 1 - span;
     if (first < 0) return true;
 
-    let sum = 0;
-    let weakest = 1;
-    for (let s = 0; s < PREAMBLE.length; s++) {
-      const rec = this.hops[(first + this.hopOffsets[s]) % 128];
-      let symbolShare = 0;
-      for (let g = 0; g < p.groups; g++) symbolShare += rec.share[binOf(p, preambleValue(s, g), g, s)];
-      symbolShare /= p.groups;
-      sum += symbolShare;
-      weakest = Math.min(weakest, symbolShare);
+    let score = 0;
+    let weakest = 0;
+    let bankIndex = 0;
+    for (let k = 0; k <= this.searchBanks.length; k++) {
+      let sum = 0;
+      let weak = 1;
+      for (let s = 0; s < PREAMBLE.length; s++) {
+        const rec = this.hops[(first + this.hopOffsets[s]) % 128];
+        let symbolShare = 0;
+        for (let g = 0; g < p.groups; g++) symbolShare += rec.shares[k][binOf(p, preambleValue(s, g), g, s)];
+        symbolShare /= p.groups;
+        sum += symbolShare;
+        weak = Math.min(weak, symbolShare);
+      }
+      if (sum / PREAMBLE.length > score) {
+        score = sum / PREAMBLE.length;
+        weakest = weak;
+        bankIndex = k;
+      }
     }
-    const score = sum / PREAMBLE.length;
     const start = this.hops[first % 128].start;
 
     if (score > SYNC_SCORE && weakest > SYNC_MIN_SYMBOL && (!this.candidate || score > this.candidate.score)) {
-      this.candidate = { score, start, age: 0 };
+      this.candidate = { score, start, age: 0, bank: bankIndex };
     } else if (this.candidate && ++this.candidate.age >= SYNC_SETTLE_HOPS) {
-      const base = this.refine(this.candidate.start);
+      if (this.candidate.bank > 0) this.setScale(1 + SEARCH_BANKS[this.candidate.bank - 1]);
+      let base = this.refine(this.candidate.start);
+      const scale = this.estimateScale(base);
+      if (Math.abs(scale - this.scale) > DOPPLER_REBUILD) {
+        this.setScale(scale);
+        base = this.refine(this.candidate.start);
+      }
       this.candidate = null;
       this.lock = { base, adjust: 0, symbol: 0, nibbles: [], confidence: [], marginSum: 0, marginCount: 0 };
       events.push({ kind: 'sync', modemId: p.id });
@@ -429,7 +525,7 @@ class MfskDemodulator implements Demodulator {
       let all = 1e-20;
       for (let s = 0; s < PREAMBLE.length; s++) {
         // Only symbol s's tone set is measured; both sums below read through binOf(…, s).
-        const e = this.measure(Math.round(coarse + off + s * this.period), s);
+        const e = this.measure(Math.round(coarse + off + (s * this.period) / this.scale), s);
         for (let g = 0; g < p.groups; g++) {
           hit += e[binOf(p, preambleValue(s, g), g, s)];
           for (let v = 0; v < TONES; v++) all += e[binOf(p, v, g, s)];
@@ -445,7 +541,7 @@ class MfskDemodulator implements Demodulator {
   private stepLocked(events: DemodEvent[]): boolean {
     const lock = this.lock!;
     const { p } = this;
-    const start = Math.round(lock.base + (PREAMBLE.length + lock.symbol) * this.period + lock.adjust);
+    const start = Math.round(lock.base + ((PREAMBLE.length + lock.symbol) * this.period) / this.scale + lock.adjust);
     if (start + this.window + this.trackOffset > this.written) return false;
 
     const symbol = PREAMBLE.length + lock.symbol;
@@ -484,6 +580,22 @@ class MfskDemodulator implements Demodulator {
       lock.adjust += TIMING_GAIN * ((late - early) / (late + early)) * this.trackOffset;
       lock.adjust = Math.max(-this.maxAdjust, Math.min(this.maxAdjust, lock.adjust));
     }
+    // Frequency tracker: the same early/late idea on the frequency axis, to follow
+    // Doppler from a moving phone. Probes a quarter tone spacing either side.
+    {
+      const df = p.toneSpacing / 4;
+      let lo = 0;
+      let hi = 0;
+      for (const bin of chosen) {
+        const f = toneFrequency(p, bin) * this.scale;
+        lo += this.toneEnergy(start, f - df);
+        hi += this.toneEnergy(start, f + df);
+      }
+      if (lo + hi > 0) {
+        const mid = toneFrequency(p, chosen[0]);
+        this.setScale(this.scale + (FREQ_GAIN * ((hi - lo) / (hi + lo)) * df) / mid);
+      }
+    }
     lock.symbol++;
 
     if (!lock.header) {
@@ -507,7 +619,7 @@ class MfskDemodulator implements Demodulator {
 
     if (lock.symbol < h.totalSymbols) return true;
     events.push(this.finish(lock, h));
-    this.resumeSearch(Math.round(lock.base + (PREAMBLE.length + h.totalSymbols) * this.period + lock.adjust));
+    this.resumeSearch(Math.round(lock.base + ((PREAMBLE.length + h.totalSymbols) * this.period) / this.scale + lock.adjust));
     return true;
   }
 
