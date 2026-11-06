@@ -17,6 +17,12 @@
 // window across the input looking for the preamble pattern, refines the timing,
 // then reads each symbol at its known position with a small early/late timing
 // tracker to follow clock drift between devices.
+//
+// Doppler: the preamble search also runs at fixed ±1500 ppm offsets (scored
+// per bank, best wins). At lock, a Doppler factor is estimated from the
+// preamble and the tone correlators are rebuilt at the shifted frequencies.
+// During the frame, a frequency early/late gate keeps following it. Symbol
+// positions scale by the same factor.
 
 import { crc32 } from './crc32.ts';
 import { rsDecode, rsEncode } from './reedSolomon.ts';
